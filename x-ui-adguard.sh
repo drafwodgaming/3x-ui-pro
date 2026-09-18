@@ -132,12 +132,14 @@ else
     agh_web_port=$(free_port)
     blue "Web port generated: $agh_web_port"
 fi
-agh_dns_port=$(free_port)
+agh_dns_port=""
+[[ -f "$AGH_YAML" ]] && agh_dns_port=$(awk '/^dns:/{d=1;next} d&&/^[^ ]/{d=0} d&&/^  port:/{print $2;exit}' "$AGH_YAML")
+[[ -n "$agh_dns_port" ]] || agh_dns_port=$(free_port)
 
 # ── install packages ──────────────────────────────────────────────────────────
 blue "Installing packages..."
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl tar ca-certificates apache2-utils
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl tar ca-certificates apache2-utils jq
 
 # ── download AdGuard Home ─────────────────────────────────────────────────────
 case "$(uname -m)" in
@@ -296,6 +298,21 @@ if [[ "$doh_status" == "200" ]]; then
     green "DoH endpoint answers (HTTP 200)."
 else
     red "DoH self-test returned HTTP ${doh_status} (expected 200) — check AdGuard Home logs."
+fi
+
+blue "Patching Xray template (DNS -> AdGuard)..."
+tpl=$(db "SELECT value FROM settings WHERE key='xrayTemplateConfig';")
+if [[ -n "$tpl" ]]; then
+    new=$(echo "$tpl" | jq -c --arg p "$agh_dns_port" '
+      .outbounds |= (map(select(.tag!="dns-to-adguard")) + [{"tag":"dns-to-adguard","protocol":"freedom","settings":{"redirect":("127.0.0.1:"+$p)}}])
+      | .routing.rules |= ([{"type":"field","port":"53","outboundTag":"dns-to-adguard"}] + map(select(.outboundTag!="dns-to-adguard")))
+      | .dns = {"servers":[{"address":"127.0.0.1","port":($p|tonumber)}]}
+      | (.outbounds[] | select(.tag=="direct") | .settings.domainStrategy) = "UseIP"')
+    db "UPDATE settings SET value='${new//\'/\'\'}' WHERE key='xrayTemplateConfig';"
+    x-ui restart
+    green "Xray template patched."
+else
+    red "xrayTemplateConfig not in DB yet: open panel -> Xray settings -> Save once, then re-run this script."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
